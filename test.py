@@ -17,6 +17,7 @@ HASH_THRESHOLD = 5
 DEFAULT_LOG_FILE = "photo_dedup.log"  # 保留默认文件名
 IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp', '.mp4', '.avi', '.mov', '.mkv'] # 添加常见视频格式
 DEFAULT_MIN_SIZE_KB = 100 # 默认最小文件大小为 100 KB
+GPS_THRESHOLD = 0.0001
 
 # ===== 工具函数 =====
 
@@ -27,6 +28,12 @@ def file_hash(filepath, algo=HASH_ALGO):
             h.update(chunk)
     return h.hexdigest()
 
+def to_decimal_degrees(dms):
+    degrees = float(dms[0].num) / float(dms[0].den)
+    minutes = float(dms[1].num) / float(dms[1].den)
+    seconds = float(dms[2].num) / float(dms[2].den)
+    return degrees + (minutes / 60.0) + (seconds / 3600.0)
+
 def get_gps_coordinates(filepath):
     try:
         with open(filepath, 'rb') as f:
@@ -34,12 +41,6 @@ def get_gps_coordinates(filepath):
             if 'GPS GPSLatitude' in tags and 'GPS GPSLongitude' in tags:
                 lat_val = tags['GPS GPSLatitude'].values
                 lon_val = tags['GPS GPSLongitude'].values
-
-                def to_decimal_degrees(dms):
-                    degrees = float(dms[0].num) / float(dms[0].den)
-                    minutes = float(dms[1].num) / float(dms[1].den)
-                    seconds = float(dms[2].num) / float(dms[2].den)
-                    return degrees + (minutes / 60.0) + (seconds / 3600.0)
 
                 latitude = to_decimal_degrees(lat_val)
                 longitude = to_decimal_degrees(lon_val)
@@ -56,7 +57,7 @@ def get_gps_coordinates(filepath):
     except Exception:
         return None
 
-def compare_gps(coord1, coord2, threshold=0.0001):
+def compare_gps(coord1, coord2, threshold=GPS_THRESHOLD):
     if coord1 is None or coord2 is None:
         return False
     lat1, lon1 = coord1
@@ -65,8 +66,8 @@ def compare_gps(coord1, coord2, threshold=0.0001):
 
 def are_similar_images(file1, file2, threshold=HASH_THRESHOLD):
     try:
-        hash1 = imagehash.phash(Image.open(file1))
-        hash2 = imagehash.phash(Image.open(file2))
+        hash1 = imagehash.phash(Image.open(file1).convert('RGB'))
+        hash2 = imagehash.phash(Image.open(file2).convert('RGB'))
         return abs(hash1 - hash2) <= threshold
     except Exception:
         return False
@@ -156,85 +157,88 @@ def safe_delete_file(file_path, perform_actions, backup_dir, delete_soft, trash_
         except Exception as e:
             logging.error(f"❌ 删除文件失败 {file_path}: {e}")
 
-def process_file(file, seen_hashes, phash_cache, phash_list, perform_actions, backup_dir, delete_soft, trash_dir, enable_console_log, source_dir_arg, min_size_bytes, simple_backup, simple_backup_with_path):
-    if file.stat().st_size < min_size_bytes:
-        return 0, 0
+def calculate_phash(filepath, cache):
+    if filepath not in cache:
+        try:
+            cache[filepath] = imagehash.phash(Image.open(filepath).convert('RGB'))
+        except Exception as e:
+            logging.warning(f"\t感知哈希计算失败: {filepath}，原因: {e}")
+            return None
+    return cache[filepath]
 
-    content_hash = file_hash(file)
+def handle_exact_duplicate(file, original, args, source_dir_arg):
+    gps_file = get_gps_coordinates(file)
+    gps_original = get_gps_coordinates(original)
+    perform_actions = args.d
+    backup_dir = Path(args.backup_dir)
+    delete_soft = args.delete_soft
+    trash_dir = Path(args.trash_dir) if args.trash_dir else None
+    enable_console_log = args.log
+    simple_backup = args.simple_backup
+    simple_backup_with_path = args.s1
 
-    # 完全重复检测
-    if content_hash in seen_hashes:
-        original = seen_hashes[content_hash]
-        gps_file = get_gps_coordinates(file)
-        gps_original = get_gps_coordinates(original)
-        if gps_file is not None and gps_original is None:
-            safe_delete_file(original, perform_actions, backup_dir, delete_soft, trash_dir, enable_console_log, perform_actions, source_dir_arg, simple_backup=simple_backup, simple_backup_with_path=simple_backup_with_path, reason="gps")
-            seen_hashes[content_hash] = file
-            log_message(f"保留含GPS: {file}, 删除: {original}", enable_console_log, perform_actions)
-            return 1, 1  # 已删除, 已保留
-        elif gps_file is None and gps_original is not None:
-            safe_delete_file(file, perform_actions, backup_dir, delete_soft, trash_dir, enable_console_log, perform_actions, source_dir_arg, simple_backup=simple_backup, simple_backup_with_path=simple_backup_with_path, reason="gps")
-            log_message(f"保留含GPS: {original}, 删除: {file}", enable_console_log, perform_actions)
-            return 1, 0  # 已删除, 已保留
-        elif gps_file is not None and gps_original is not None and compare_gps(gps_file, gps_original):
-            safe_delete_file(file, perform_actions, backup_dir, delete_soft, trash_dir, enable_console_log, perform_actions, source_dir_arg, simple_backup=simple_backup, simple_backup_with_path=simple_backup_with_path, reason="duplicate")
-            log_message(f"保留: {original}, 删除: {file}", enable_console_log, perform_actions)
-            return 1, 0
-        else:
-            safe_delete_file(file, perform_actions, backup_dir, delete_soft, trash_dir, enable_console_log, perform_actions, source_dir_arg, simple_backup=simple_backup, simple_backup_with_path=simple_backup_with_path, reason="duplicate") # 如果 GPS 信息差异过大，暂时视为重复文件
-            log_message(f"保留: {original}, 删除: {file} (GPS位置可能不同)", enable_console_log, perform_actions)
-            return 1, 0
+    if gps_file is not None and gps_original is None:
+        safe_delete_file(original, perform_actions, backup_dir, delete_soft, trash_dir, enable_console_log, perform_actions, source_dir_arg, simple_backup=simple_backup, simple_backup_with_path=simple_backup_with_path, reason="gps")
+        log_message(f"保留含GPS: {file}, 删除: {original}", enable_console_log, perform_actions)
+        return 1, 1
+    elif gps_file is None and gps_original is not None:
+        safe_delete_file(file, perform_actions, backup_dir, delete_soft, trash_dir, enable_console_log, perform_actions, source_dir_arg, simple_backup=simple_backup, simple_backup_with_path=simple_backup_with_path, reason="gps")
+        log_message(f"保留含GPS: {original}, 删除: {file}", enable_console_log, perform_actions)
+        return 1, 0
+    elif gps_file is not None and gps_original is not None and compare_gps(gps_file, gps_original):
+        safe_delete_file(file, perform_actions, backup_dir, delete_soft, trash_dir, enable_console_log, perform_actions, source_dir_arg, simple_backup=simple_backup, simple_backup_with_path=simple_backup_with_path, reason="duplicate")
+        log_message(f"保留: {original}, 删除: {file}", enable_console_log, perform_actions)
+        return 1, 0
     else:
-        is_duplicate = False
-        if args.include_similar:
-            try:
-                if file in phash_cache:
-                    file_phash = phash_cache[file]
-                else:
-                    file_phash = imagehash.phash(Image.open(file).convert('RGB'))
-                    phash_cache[file] = file_phash
+        safe_delete_file(file, perform_actions, backup_dir, delete_soft, trash_dir, enable_console_log, perform_actions, source_dir_arg, simple_backup=simple_backup, simple_backup_with_path=simple_backup_with_path, reason="duplicate") # 如果 GPS 信息差异过大，暂时视为重复文件
+        log_message(f"保留: {original}, 删除: {file} (GPS位置可能不同)", enable_console_log, perform_actions)
+        return 1, 0
 
-                for original_file, original_phash in phash_list:
-                    if abs(file_phash - original_phash) <= args.hash_threshold:
-                        gps_file = get_gps_coordinates(file)
-                        gps_orig = get_gps_coordinates(original_file)
+def handle_new_file(file, seen_hashes, phash_cache, phash_list, args, source_dir_arg):
+    is_duplicate = False
+    perform_actions = args.d
+    backup_dir = Path(args.backup_dir)
+    delete_soft = args.delete_soft
+    trash_dir = Path(args.trash_dir) if args.trash_dir else None
+    enable_console_log = args.log
+    simple_backup = args.simple_backup
+    simple_backup_with_path = args.s1
+    hash_threshold = args.hash_threshold
+    prefer_resolution = args.prefer_resolution
 
-                        if gps_file and not gps_orig:
-                            safe_delete_file(original_file, perform_actions, backup_dir, delete_soft, trash_dir, enable_console_log, perform_actions, source_dir_arg, simple_backup=simple_backup, simple_backup_with_path=simple_backup_with_path, reason="gps")
-                            log_message(f"[相似] 保留含GPS: {file}, 删除: {original_file}", enable_console_log, perform_actions)
-                            phash_list[:] = [(f, h) for f, h in phash_list if f != original_file]
-                            phash_list.append((file, file_phash))
-                            return 1, 1
-                        elif not gps_file and gps_orig:
-                            safe_delete_file(file, perform_actions, backup_dir, delete_soft, trash_dir, enable_console_log, perform_actions, source_dir_arg, simple_backup=simple_backup, simple_backup_with_path=simple_backup_with_path, reason="gps")
-                            log_message(f"[相似] 保留含GPS: {original_file}, 删除: {file}", enable_console_log, perform_actions)
-                            return 1, 0
-                        else:
-                            if args.prefer_resolution:
-                                res_file = get_image_resolution(file)
-                                res_orig = get_image_resolution(original_file)
-                                if res_file > res_orig:
-                                    safe_delete_file(original_file, perform_actions, backup_dir, delete_soft, trash_dir, enable_console_log, perform_actions, source_dir_arg, simple_backup=simple_backup, simple_backup_with_path=simple_backup_with_path, reason="resolution")
-                                    log_message(f"[相似] 保留分辨率更高: {file}, 删除: {original_file}", enable_console_log, perform_actions)
-                                    phash_list[:] = [(f, h) for f, h in phash_list if f != original_file]
-                                    phash_list.append((file, file_phash))
-                                    return 1, 1
-                                elif res_file < res_orig:
-                                    safe_delete_file(file, perform_actions, backup_dir, delete_soft, trash_dir, enable_console_log, perform_actions, source_dir_arg, simple_backup=simple_backup, simple_backup_with_path=simple_backup_with_path, reason="resolution")
-                                    log_message(f"[相似] 保留: {original_file} (分辨率更高), 删除: {file}", enable_console_log, perform_actions)
-                                    return 1, 0
-                                else: # 如果分辨率相同，则比较文件大小
-                                    if file.stat().st_size > original_file.stat().st_size:
-                                        safe_delete_file(original_file, perform_actions, backup_dir, delete_soft, trash_dir, enable_console_log, perform_actions, source_dir_arg, simple_backup=simple_backup, simple_backup_with_path=simple_backup_with_path, reason="larger")
-                                        log_message(f"[相似] 保留文件较大: {file}, 删除: {original_file}", enable_console_log, perform_actions)
-                                        phash_list[:] = [(f, h) for f, h in phash_list if f != original_file]
-                                        phash_list.append((file, file_phash))
-                                        return 1, 1
-                                    else:
-                                        safe_delete_file(file, perform_actions, backup_dir, delete_soft, trash_dir, enable_console_log, perform_actions, source_dir_arg, simple_backup=simple_backup, simple_backup_with_path=simple_backup_with_path, reason="larger")
-                                        log_message(f"[相似] 保留: {original_file} (文件较大), 删除: {file}", enable_console_log, perform_actions)
-                                        return 1, 0
-                            else: # 如果不优先考虑分辨率，则比较文件大小
+    if args.include_similar:
+        file_phash = calculate_phash(file, phash_cache)
+        if file_phash is not None:
+            for original_file, original_phash in list(phash_list): # 使用 list 进行安全迭代
+                if original_phash is not None and abs(file_phash - original_phash) <= hash_threshold:
+                    gps_file = get_gps_coordinates(file)
+                    gps_orig = get_gps_coordinates(original_file)
+
+                    if gps_file and not gps_orig:
+                        safe_delete_file(original_file, perform_actions, backup_dir, delete_soft, trash_dir, enable_console_log, perform_actions, source_dir_arg, simple_backup=simple_backup, simple_backup_with_path=simple_backup_with_path, reason="gps")
+                        log_message(f"[相似] 保留含GPS: {file}, 删除: {original_file}", enable_console_log, perform_actions)
+                        phash_list[:] = [(f, h) for f, h in phash_list if f != original_file]
+                        phash_list.append((file, file_phash))
+                        return 1, 1
+                    elif not gps_file and gps_orig:
+                        safe_delete_file(file, perform_actions, backup_dir, delete_soft, trash_dir, enable_console_log, perform_actions, source_dir_arg, simple_backup=simple_backup, simple_backup_with_path=simple_backup_with_path, reason="gps")
+                        log_message(f"[相似] 保留含GPS: {original_file}, 删除: {file}", enable_console_log, perform_actions)
+                        return 1, 0
+                    else:
+                        if prefer_resolution:
+                            res_file = get_image_resolution(file)
+                            res_orig = get_image_resolution(original_file)
+                            if res_file > res_orig:
+                                safe_delete_file(original_file, perform_actions, backup_dir, delete_soft, trash_dir, enable_console_log, perform_actions, source_dir_arg, simple_backup=simple_backup, simple_backup_with_path=simple_backup_with_path, reason="resolution")
+                                log_message(f"[相似] 保留分辨率更高: {file}, 删除: {original_file}", enable_console_log, perform_actions)
+                                phash_list[:] = [(f, h) for f, h in phash_list if f != original_file]
+                                phash_list.append((file, file_phash))
+                                return 1, 1
+                            elif res_file < res_orig:
+                                safe_delete_file(file, perform_actions, backup_dir, delete_soft, trash_dir, enable_console_log, perform_actions, source_dir_arg, simple_backup=simple_backup, simple_backup_with_path=simple_backup_with_path, reason="resolution")
+                                log_message(f"[相似] 保留: {original_file} (分辨率更高), 删除: {file}", enable_console_log, perform_actions)
+                                return 1, 0
+                            else: # 如果分辨率相同，则比较文件大小
                                 if file.stat().st_size > original_file.stat().st_size:
                                     safe_delete_file(original_file, perform_actions, backup_dir, delete_soft, trash_dir, enable_console_log, perform_actions, source_dir_arg, simple_backup=simple_backup, simple_backup_with_path=simple_backup_with_path, reason="larger")
                                     log_message(f"[相似] 保留文件较大: {file}, 删除: {original_file}", enable_console_log, perform_actions)
@@ -245,18 +249,25 @@ def process_file(file, seen_hashes, phash_cache, phash_list, perform_actions, ba
                                     safe_delete_file(file, perform_actions, backup_dir, delete_soft, trash_dir, enable_console_log, perform_actions, source_dir_arg, simple_backup=simple_backup, simple_backup_with_path=simple_backup_with_path, reason="larger")
                                     log_message(f"[相似] 保留: {original_file} (文件较大), 删除: {file}", enable_console_log, perform_actions)
                                     return 1, 0
-                        is_duplicate = True
-                        break
+                        else: # 如果不优先考虑分辨率，则比较文件大小
+                            if file.stat().st_size > original_file.stat().st_size:
+                                safe_delete_file(original_file, perform_actions, backup_dir, delete_soft, trash_dir, enable_console_log, perform_actions, source_dir_arg, simple_backup=simple_backup, simple_backup_with_path=simple_backup_with_path, reason="larger")
+                                log_message(f"[相似] 保留文件较大: {file}, 删除: {original_file}", enable_console_log, perform_actions)
+                                phash_list[:] = [(f, h) for f, h in phash_list if f != original_file]
+                                phash_list.append((file, file_phash))
+                                return 1, 1
+                            else:
+                                safe_delete_file(file, perform_actions, backup_dir, delete_soft, trash_dir, enable_console_log, perform_actions, source_dir_arg, simple_backup=simple_backup, simple_backup_with_path=simple_backup_with_path, reason="larger")
+                                log_message(f"[相似] 保留: {original_file} (文件较大), 删除: {file}", enable_console_log, perform_actions)
+                                return 1, 0
+                    is_duplicate = True
+                    break
+            if not is_duplicate and file_phash is not None:
+                phash_list.append((file, file_phash))
 
-                if not is_duplicate:
-                    phash_list.append((file, file_phash))
-
-            except Exception as e:
-                logging.warning(f"\t感知哈希处理失败: {file}，原因: {e}")
-
-        if not is_duplicate:
-            seen_hashes[content_hash] = file
-            return 0, 1  # 已删除, 已保留
+    if not is_duplicate:
+        seen_hashes[content_hash] = file
+        return 0, 1 # 已删除, 已保留
 
     return 0, 0 # 不应该执行到这里
 
@@ -276,6 +287,15 @@ def process_directory(perform_actions, source_dir, backup_dir, include_similar, 
     retained_count = 0
 
     print(f"\t🔍 开始扫描目录: {source_dir}, 共找到 {scanned_count} 个文件 (最小大小: {min_size_bytes // 1024} KB), 包括视频: True") # 简化处理，默认包含视频
+
+    if include_similar:
+        print("\t🎨 预先计算感知哈希...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
+            futures = [executor.submit(calculate_phash, file, phash_cache) for file in files]
+            for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                progress = (i + 1) / scanned_count * 100
+                print(f"\t\r📝 感知哈希计算进度: {progress:.2f}% ({i + 1}/{scanned_count})", end="")
+        print("\n\t✅ 感知哈希计算完成.")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
         futures = [executor.submit(process_file, file, seen_hashes, phash_cache, phash_list, perform_actions, backup_dir, delete_soft, trash_dir, enable_console_log, source_dir, min_size_bytes, simple_backup, simple_backup_with_path) for i, file in enumerate(files)]
