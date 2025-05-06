@@ -5,9 +5,10 @@ import logging
 import argparse
 from pathlib import Path
 from datetime import datetime
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 import imagehash
 import exifread
+from exifread.exceptions import EXIFError
 import sys
 import concurrent.futures
 
@@ -23,10 +24,14 @@ GPS_THRESHOLD = 0.0001
 
 def file_hash(filepath, algo=HASH_ALGO):
     h = hashlib.new(algo)
-    with open(filepath, 'rb') as f:
-        while chunk := f.read(8192):
-            h.update(chunk)
-    return h.hexdigest()
+    try:
+        with open(filepath, 'rb') as f:
+            while chunk := f.read(8192):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception as e:
+        logging.error(f"❌ 计算文件哈希失败: {filepath}，原因: {e}")
+        return None
 
 def to_decimal_degrees(dms):
     degrees = float(dms[0].num) / float(dms[0].den)
@@ -37,24 +42,35 @@ def to_decimal_degrees(dms):
 def get_gps_coordinates(filepath):
     try:
         with open(filepath, 'rb') as f:
-            tags = exifread.process_file(f, stop_tag="GPS GPSLatitude", details=False)
-            if 'GPS GPSLatitude' in tags and 'GPS GPSLongitude' in tags:
-                lat_val = tags['GPS GPSLatitude'].values
-                lon_val = tags['GPS GPSLongitude'].values
+            try:
+                tags = exifread.process_file(f, stop_tag="GPS GPSLatitude", details=False)
+                if 'GPS GPSLatitude' in tags and 'GPS GPSLongitude' in tags:
+                    try:
+                        lat_val = tags['GPS GPSLatitude'].values
+                        lon_val = tags['GPS GPSLongitude'].values
+                        latitude = to_decimal_degrees(lat_val)
+                        longitude = to_decimal_degrees(lon_val)
+                        lat_ref = tags.get('GPS GPSLatitudeRef')
+                        lon_ref = tags.get('GPS GPSLongitudeRef')
 
-                latitude = to_decimal_degrees(lat_val)
-                longitude = to_decimal_degrees(lon_val)
-                lat_ref = tags.get('GPS GPSLatitudeRef')
-                lon_ref = tags.get('GPS GPSLongitudeRef')
-
-                if lat_ref and lat_ref.values[0] == 'S':
-                    latitude = -latitude
-                if lon_ref and lon_ref.values[0] == 'W':
-                    longitude = -longitude
-
-                return latitude, longitude
-        return None
-    except Exception:
+                        if lat_ref and lat_ref.values[0] == 'S':
+                            latitude = -latitude
+                        if lon_ref and lon_ref.values[0] == 'W':
+                            longitude = -longitude
+                        return latitude, longitude
+                    except (AttributeError, TypeError) as e:
+                        logging.warning(f"⚠️ 解析 GPS 坐标失败: {filepath}，原因: {e}")
+                        return None
+                elif 'GPS GPSLatitude' in tags or 'GPS GPSLongitude' in tags:
+                    logging.warning(f"⚠️ GPS 坐标信息不完整: {filepath}")
+                    return None
+                else:
+                    return None
+            except EXIFError as e:
+                logging.warning(f"⚠️ 读取 EXIF 信息失败 (GPS 相关): {filepath}，原因: {e}")
+                return None
+    except Exception as e:
+        logging.error(f"❌ 打开文件或处理 GPS 信息失败: {filepath}，原因: {e}")
         return None
 
 def compare_gps(coord1, coord2, threshold=GPS_THRESHOLD):
@@ -66,17 +82,33 @@ def compare_gps(coord1, coord2, threshold=GPS_THRESHOLD):
 
 def are_similar_images(file1, file2, threshold=HASH_THRESHOLD):
     try:
-        hash1 = imagehash.phash(Image.open(file1).convert('RGB'))
-        hash2 = imagehash.phash(Image.open(file2).convert('RGB'))
-        return abs(hash1 - hash2) <= threshold
-    except Exception:
+        with Image.open(file1) as img1:
+            with Image.open(file2) as img2:
+                hash1 = imagehash.phash(img1.convert('RGB'))
+                hash2 = imagehash.phash(img2.convert('RGB'))
+                return abs(hash1 - hash2) <= threshold
+    except UnidentifiedImageError as e:
+        logging.warning(f"⚠️ 无法识别的图片格式，跳过相似性比较: {file1} 或 {file2}，原因: {e}")
+        return False
+    except FileNotFoundError:
+        logging.error(f"❌ 文件未找到，跳过相似性比较: {file1} 或 {file2}")
+        return False
+    except Exception as e:
+        logging.error(f"❌ 比较相似图片失败: {file1}, {file2}，原因: {e}")
         return False
 
 def get_image_resolution(filepath):
     try:
-        img = Image.open(filepath)
-        return img.size[0] * img.size[1]
-    except Exception:
+        with Image.open(filepath) as img:
+            return img.size[0] * img.size[1]
+    except UnidentifiedImageError as e:
+        logging.warning(f"⚠️ 无法识别的图片格式，无法获取分辨率: {filepath}，原因: {e}")
+        return 0
+    except FileNotFoundError:
+        logging.error(f"❌ 文件未找到，无法获取分辨率: {filepath}")
+        return 0
+    except Exception as e:
+        logging.error(f"❌ 获取图片分辨率失败: {filepath}，原因: {e}")
         return 0
 
 def backup_file(file_path, perform_actions, backup_dir, source_dir_arg, simple_backup=False, simple_backup_with_path=False, reason=""):
@@ -118,9 +150,12 @@ def backup_file(file_path, perform_actions, backup_dir, source_dir_arg, simple_b
         logging.info(f"备份文件已存在，跳过: {backup_path}")
         return
 
-    if perform_actions:
-        shutil.copy2(file_path, backup_path)
-    logging.info(f"{'[执行] ' if perform_actions else '[模拟] '}已备份: {file_path} → {backup_path}")
+    try:
+        if perform_actions:
+            shutil.copy2(file_path, backup_path)
+        logging.info(f"{'[执行] ' if perform_actions else '[模拟] '}已备份: {file_path} → {backup_path}")
+    except Exception as e:
+        logging.error(f"❌ 备份文件失败: {file_path} 到 {backup_path}，原因: {e}")
 
 def is_image_file(filepath):
     try:
@@ -160,9 +195,16 @@ def safe_delete_file(file_path, perform_actions, backup_dir, delete_soft, trash_
 def calculate_phash(filepath, cache):
     if filepath not in cache:
         try:
-            cache[filepath] = imagehash.phash(Image.open(filepath).convert('RGB'))
+            with Image.open(filepath) as img:
+                cache[filepath] = imagehash.phash(img.convert('RGB'))
+        except UnidentifiedImageError as e:
+            logging.warning(f"⚠️ 无法识别的图片格式，无法计算感知哈希: {filepath}，原因: {e}")
+            return None
+        except FileNotFoundError:
+            logging.error(f"❌ 文件未找到，无法计算感知哈希: {filepath}")
+            return None
         except Exception as e:
-            logging.warning(f"\t感知哈希计算失败: {filepath}，原因: {e}")
+            logging.error(f"❌ 计算感知哈希失败: {filepath}，原因: {e}")
             return None
     return cache[filepath]
 
@@ -293,9 +335,9 @@ def process_directory(perform_actions, source_dir, backup_dir, include_similar, 
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
             futures = [executor.submit(calculate_phash, file, phash_cache) for file in files]
             for i, future in enumerate(concurrent.futures.as_completed(futures)):
-                progress = (i + 1) / scanned_count * 100
-                print(f"\t\r📝 感知哈希计算进度: {progress:.2f}% ({i + 1}/{scanned_count})", end="")
+                pass
         print("\n\t✅ 感知哈希计算完成.")
+        phash_list = [(f, phash_cache.get(f)) for f in files if phash_cache.get(f) is not None]
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
         futures = [executor.submit(process_file, file, seen_hashes, phash_cache, phash_list, perform_actions, backup_dir, delete_soft, trash_dir, enable_console_log, source_dir, min_size_bytes, simple_backup, simple_backup_with_path) for i, file in enumerate(files)]
